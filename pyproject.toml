@@ -3,8 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "mcp-apple-music"
-version = "0.1.0"
+name = "mcp-apple-music-server"
+version = "1.0.1"
+mcpName = "io.github.Cifero74/mcp-apple-music"
 description = "MCP Server for Apple Music — search, library, playlist management via Claude"
 readme = "README.md"
 license = { text = "MIT" }

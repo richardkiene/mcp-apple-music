@@ -1,0 +1,57 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Cifero74/mcp-apple-music",
+  "description": "Apple Music MCP server — search catalog, manage playlists, and access your library via Claude.",
+  "repository": {
+    "url": "https://github.com/Cifero74/mcp-apple-music",
+    "source": "github"
+  },
+  "version": "1.0.1",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "mcp-apple-music-server",
+      "version": "1.0.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "APPLE_TEAM_ID",
+          "description": "Apple Developer Team ID",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "APPLE_KEY_ID",
+          "description": "Apple MusicKit Key ID",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "APPLE_PRIVATE_KEY",
+          "description": "Apple MusicKit private key content (ES256, PEM format)",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "APPLE_MUSIC_USER_TOKEN",
+          "description": "Apple Music user token for personal library access",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "APPLE_STOREFRONT",
+          "description": "Apple Music storefront country code (default: us)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}

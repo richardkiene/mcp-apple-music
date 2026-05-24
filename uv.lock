@@ -353,8 +353,8 @@ cli = [
 ]
 
 [[package]]
-name = "mcp-apple-music"
-version = "0.1.0"
+name = "mcp-apple-music-server"
+version = "1.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },

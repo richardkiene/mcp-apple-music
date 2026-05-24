@@ -1,5 +1,7 @@
 # mcp-apple-music 🎵
 
+mcp-name: io.github.Cifero74/mcp-apple-music
+
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
@@ -117,6 +119,8 @@ Browser OAuth ──►  Music User Token (stored locally)    ─┘
 ```
 
 > ⚠️ **Playback control** (play/pause/skip) is not available via Apple's REST API. It requires native MusicKit frameworks (iOS/macOS app) or MusicKit JS running in a browser context.
+>
+> For playback control, check out [chrome-relay](https://chrome-relay.kushalsm.com) — a companion CLI that lets an MCP server drive a `music.apple.com` tab already open in Chrome, enabling play/pause/skip without shipping a MusicKit JS shim.
 
 ---
 
