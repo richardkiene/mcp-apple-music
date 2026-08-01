@@ -77,7 +77,19 @@ uv run mcp-apple-music-setup
 python -m mcp_apple_music.setup
 ```
 
-The wizard will ask for your **Team ID**, **Key ID**, and the path to your `.p8` file. It then opens a browser page where you click **"Authorise Apple Music"** — this uses Apple's official MusicKit JS to obtain your Music User Token, which is stored securely at `~/.config/mcp-apple-music/config.json` (file permissions: `600`).
+The wizard will ask for your **Team ID**, **Key ID**, and the path to your `.p8` file. It then opens a browser page where you click **"Authorise Apple Music"** — this uses Apple's official MusicKit JS to obtain your Music User Token, which is stored at `~/.config/mcp-apple-music/config.json`, created `0600` inside a `0700` directory.
+
+The browser URL carries a `?s=` value: a one-time secret generated for that run. The wizard's local server refuses any request that doesn't present it, so don't share the URL. If you land on a `403`, you almost certainly opened `http://localhost:PORT` by hand instead of the full URL the wizard printed.
+
+**Choosing a port.** The callback server defaults to `8888`. If something already owns that port, pick another:
+
+```bash
+uv run mcp-apple-music-setup --port 8899
+# or
+MCP_APPLE_MUSIC_SETUP_PORT=8899 uv run mcp-apple-music-setup
+```
+
+The flag wins over the environment variable. Apple doesn't need the port registered anywhere — MusicKit JS authorises in a popup rather than via a redirect URI.
 
 ### 4. Add to Claude Desktop
 
@@ -109,8 +121,8 @@ Restart Claude Desktop — you should see the apple-music tools available in the
 
 Apple Music requires two separate tokens:
 
-- **Developer Token** — a JWT you sign locally with your `.p8` private key. Valid up to 6 months; the server regenerates it automatically before expiry. Your key never leaves your machine.
-- **Music User Token** — obtained once via MusicKit JS OAuth in the browser (the setup wizard handles this). Stored locally at `~/.config/mcp-apple-music/config.json`.
+- **Developer Token** — a JWT you sign locally with your `.p8` private key. Minted with a **1-hour** lifetime and re-signed on demand from the local key. Apple permits up to 6 months, but since the token is regenerated whenever it's needed, a long lifetime buys nothing and only widens the window in which a leaked token stays usable. Your key never leaves your machine.
+- **Music User Token** — obtained once via MusicKit JS OAuth in the browser (the setup wizard handles this). Stored locally at `~/.config/mcp-apple-music/config.json`. Apple sets its ~6-month lifetime; it is *not* capped by the developer token's expiry, so the short developer TTL above costs you nothing.
 
 ```
 Your .p8 key  ──►  Developer Token (JWT, auto-renewed)  ─┐
@@ -135,10 +147,34 @@ mcp-apple-music/
 │       ├── client.py    — Async HTTP client for api.music.apple.com
 │       ├── server.py    — FastMCP server with all 11 tools
 │       └── setup.py     — One-time setup wizard (browser-based OAuth)
+├── tests/               — pytest suite (auth, wizard guards, URL handling)
 ├── config.example.json  — Example config structure (no secrets)
 ├── pyproject.toml
 └── README.md
 ```
+
+Run the tests with:
+
+```bash
+uv sync
+uv run pytest tests/ -q
+```
+
+---
+
+## Security notes
+
+This fork hardens several things against the upstream code. What's covered:
+
+- **The setup wizard's local server** requires a per-run nonce on both routes, validates the `Host` header, and validates `Origin` on the token callback. Without these, a page on another origin could plant a foreign Music User Token via a preflight-dodging `text/plain` POST, and a DNS-rebinding attacker could read the signed developer token out of the served HTML.
+- **Developer tokens live 1 hour**, not the 6-month maximum.
+- **`config.json` is created `0600`** via `os.open` rather than created at the process umask and narrowed afterwards.
+- **Playlist IDs are percent-encoded** before entering the URL path. `httpx` resolves `..` segments, so an unencoded ID could retarget a request at a different Apple Music endpoint.
+
+What is **not** addressed, and worth knowing:
+
+- **Tool output is untrusted input.** Song, album, and playlist names — including playlist descriptions — come from Apple's catalog and flow into the model's context verbatim. Anyone who can get content into that catalog controls text your assistant reads, and this server exposes `create_playlist` and `add_tracks_to_playlist`. There is no delete or purchase tool, so the blast radius is bounded, but treat "read my library and act on it" prompts with the same caution you'd apply to any untrusted input.
+- **A Music User Token is library-scoped.** It cannot touch your subscription, Apple ID, or payment methods. Revoking the MusicKit key at developer.apple.com invalidates the pairing.
 
 ---
 
