@@ -7,25 +7,41 @@ Run this script ONCE to:
   3. Save everything to ~/.config/mcp-apple-music/config.json
 
 Usage:
-    python setup_auth.py
+    python -m mcp_apple_music.setup
     # or, after installation:
     mcp-apple-music-setup
+
+    # the wizard's local callback port is configurable, for machines where
+    # something already owns the default:
+    mcp-apple-music-setup --port 8899
+    MCP_APPLE_MUSIC_SETUP_PORT=8899 mcp-apple-music-setup
 """
 
+import argparse
+import hmac
 import json
+import os
+import secrets
 import sys
 import threading
-import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
-import jwt
+from .auth import generate_developer_token
+from .keysource import SOURCE_KEYS, PrivateKeyError, load_private_key
 
 CONFIG_DIR = Path.home() / ".config" / "mcp-apple-music"
 CONFIG_PATH = CONFIG_DIR / "config.json"
-PORT = 8888
+
+DEFAULT_PORT = 8888
+PORT_ENV_VAR = "MCP_APPLE_MUSIC_SETUP_PORT"
+
+# Loopback only — the served page carries the developer token, so this must
+# never be reachable off-host.
+BIND_HOST = "127.0.0.1"
 
 # ------------------------------------------------------------------ #
 #  HTML page served to the browser                                    #
@@ -106,10 +122,13 @@ _HTML = """\
         const userToken = await music.authorize();
 
         status.textContent = 'Saving token…';
+        // The nonce arrives in this page's own URL; echoing it back proves the
+        // request came from the page the wizard opened, not a foreign origin.
+        const nonce = new URLSearchParams(location.search).get('s') || '';
         const res = await fetch('/save_token', {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({ token: userToken })
+          body:    JSON.stringify({ token: userToken, nonce: nonce })
         });
 
         if (res.ok) {
@@ -119,9 +138,20 @@ _HTML = """\
           throw new Error('Server responded with ' + res.status);
         }
       } catch (e) {
-        status.textContent = 'Error: ' + e.message;
+        // MusicKit raises MKError, whose name and errorCode say far more than
+        // message alone — 'Unauthorized' on its own cannot distinguish a denied
+        // consent from a missing subscription from a failed token exchange.
+        // Surface all of it rather than making the next person guess.
+        const parts = [e.name, e.errorCode, e.message].filter(Boolean);
+        status.textContent = 'Error: ' + (parts.join(' / ') || String(e));
         status.className   = 'err';
-        btn.disabled       = false;
+        console.error('MusicKit authorisation failed:', e);
+        try {
+          console.error(
+            'detail:', JSON.stringify(e, Object.getOwnPropertyNames(e))
+          );
+        } catch (_) { /* non-serialisable error object */ }
+        btn.disabled = false;
       }
     });
   </script>
@@ -133,42 +163,128 @@ _HTML = """\
 #  Local HTTP server                                                  #
 # ------------------------------------------------------------------ #
 
+# A Music User Token is well under a kilobyte; refuse anything that isn't
+# plausibly one rather than reading an unbounded body into memory.
+_MAX_BODY_BYTES = 64 * 1024
+
 _token_event: threading.Event = threading.Event()
 _received_token: list[str] = []
 
 
 class _Handler(BaseHTTPRequestHandler):
-    """Minimal HTTP handler: serves the auth page and receives the token."""
+    """Minimal HTTP handler: serves the auth page and receives the token.
 
-    html: str = ""  # set on the class before starting the server
+    Three checks guard both routes, because this server briefly holds a signed
+    developer token and accepts a Music User Token:
+
+      * Host   — a request whose Host header is not our own loopback origin is
+                 a DNS-rebinding attempt; without this check a foreign page can
+                 become same-origin with us and read the token out of the HTML.
+      * nonce  — a per-run secret, delivered only in the URL the wizard opens.
+                 An attacker who cannot read our page cannot guess it.
+      * Origin — on POST only. A JSON body is not a CORS "simple request", but
+                 text/plain is, so a cross-origin form-style POST would
+                 otherwise reach us unpreflighted and plant a foreign token.
+    """
+
+    html: str = ""            # set on the class before starting the server
+    nonce: str = ""           # per-run secret, compared in constant time
+    allowed_hosts: frozenset = frozenset()
+    allowed_origins: frozenset = frozenset()
+
+    # -------------------------------------------------------------- #
+    #  Guards                                                          #
+    # -------------------------------------------------------------- #
+
+    def _host_ok(self) -> bool:
+        return self.headers.get("Host", "") in self.allowed_hosts
+
+    def _nonce_ok(self, supplied: object) -> bool:
+        return isinstance(supplied, str) and hmac.compare_digest(supplied, self.nonce)
+
+    def _deny(self, code: int, reason: str) -> None:
+        body = reason.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # -------------------------------------------------------------- #
+    #  Routes                                                          #
+    # -------------------------------------------------------------- #
 
     def do_GET(self) -> None:
-        if urlparse(self.path).path == "/":
-            body = self.html.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        else:
-            self.send_response(404)
-            self.end_headers()
+        if not self._host_ok():
+            return self._deny(403, "Forbidden: unexpected Host header.")
+
+        parsed = urlparse(self.path)
+        if parsed.path != "/":
+            return self._deny(404, "Not found.")
+
+        supplied = parse_qs(parsed.query).get("s", [""])[0]
+        if not self._nonce_ok(supplied):
+            return self._deny(403, "Forbidden: missing or invalid setup nonce.")
+
+        body = self.html.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        # The page embeds a signed token; keep it out of caches.
+        self.send_header("Cache-Control", "no-store")
+        # Deliberately NOT no-referrer. Apple's authorisation service rejects
+        # the token exchange with AUTHORIZATION_ERROR when the browser sends no
+        # Referer — and it does so *after* the consent screen has succeeded,
+        # which makes it look like an account or network fault rather than a
+        # response header. Bisected against a working upstream baseline.
+        #
+        # strict-origin-when-cross-origin still withholds the path and query
+        # cross-origin, so the ?s= nonce never reaches Apple, while supplying
+        # the origin the handshake requires.
+        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self) -> None:
-        if urlparse(self.path).path == "/save_token":
+        if not self._host_ok():
+            return self._deny(403, "Forbidden: unexpected Host header.")
+
+        if urlparse(self.path).path != "/save_token":
+            return self._deny(404, "Not found.")
+
+        origin = self.headers.get("Origin")
+        if origin is not None and origin not in self.allowed_origins:
+            return self._deny(403, "Forbidden: cross-origin request rejected.")
+
+        try:
             length = int(self.headers.get("Content-Length", 0))
-            data   = json.loads(self.rfile.read(length))
-            _received_token.append(data["token"])
+        except ValueError:
+            return self._deny(400, "Bad request: invalid Content-Length.")
+        if length <= 0 or length > _MAX_BODY_BYTES:
+            return self._deny(400, "Bad request: unacceptable body size.")
 
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"ok":true}')
+        try:
+            data = json.loads(self.rfile.read(length))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return self._deny(400, "Bad request: body is not valid JSON.")
+        if not isinstance(data, dict):
+            return self._deny(400, "Bad request: expected a JSON object.")
 
-            _token_event.set()
-        else:
-            self.send_response(404)
-            self.end_headers()
+        if not self._nonce_ok(data.get("nonce")):
+            return self._deny(403, "Forbidden: missing or invalid setup nonce.")
+
+        token = data.get("token")
+        if not isinstance(token, str) or not token:
+            return self._deny(400, "Bad request: missing token.")
+
+        _received_token.append(token)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"ok":true}')
+
+        _token_event.set()
 
     def log_message(self, *_) -> None:  # silence access logs
         pass
@@ -187,10 +303,21 @@ def _load_existing() -> dict:
 
 
 def _save_config(cfg: dict) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_PATH, "w") as f:
+    """Write config.json so it is never briefly readable by other users.
+
+    Creating the file with open(..., "w") applies the process umask (commonly
+    0644) and only narrows it afterwards, which leaves the Music User Token
+    world-readable for the duration of the write. os.open with an explicit mode
+    closes that window.
+    """
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(cfg, f, indent=2)
-    CONFIG_PATH.chmod(0o600)  # owner read/write only
+    # mkdir's mode is ignored when the directory already exists, and O_CREAT's
+    # mode is ignored when the file does; enforce both for pre-existing paths.
+    CONFIG_DIR.chmod(0o700)
+    CONFIG_PATH.chmod(0o600)
 
 
 def _ask(prompt: str, default: str = "") -> str:
@@ -199,17 +326,74 @@ def _ask(prompt: str, default: str = "") -> str:
     return value or default
 
 
-def _generate_developer_token(cfg: dict) -> str:
-    key_path = Path(cfg["private_key_path"]).expanduser()
-    with open(key_path) as f:
-        private_key = f.read()
-    now = int(time.time())
-    return jwt.encode(
-        {"iss": cfg["team_id"], "iat": now, "exp": now + 15_777_000},
-        private_key,
-        algorithm="ES256",
-        headers={"kid": cfg["key_id"]},
+def _ask_key_source(cfg: dict) -> None:
+    """Ask where the .p8 lives and record exactly one source key in cfg."""
+    print("\n🔐  Where is your MusicKit .p8 signing key?")
+    print("      1) 1Password  — recommended; the key never lands on disk")
+    print("      2) A file on this machine")
+    choice = _ask("  Choose", default="1")
+
+    # Clear every source first: switching sources must not leave a stale one
+    # behind, which would be rejected later as an ambiguous configuration.
+    for key in SOURCE_KEYS:
+        cfg.pop(key, None)
+
+    if choice == "2":
+        cfg["private_key_path"] = _ask(
+            "  Path to .p8 file (e.g. ~/Downloads/AuthKey_XXXXXX.p8)"
+        )
+        return
+
+    print("\n     In 1Password, right-click the .p8 attachment and choose")
+    print("     'Copy Secret Reference'. It looks like:")
+    print("         op://Private/MusicKit/AuthKey.p8\n")
+    cfg["private_key_op_ref"] = _ask("  1Password secret reference")
+
+    print("\n     Leave the next answer blank unless `op` is off your PATH.")
+    print("     GUI-launched apps often need its absolute path here.")
+    op_path = _ask("  Path to the `op` binary")
+    if op_path:
+        cfg["op_cli_path"] = op_path
+
+
+def _resolve_port(argv: Optional[list[str]] = None) -> int:
+    """Resolve the wizard's callback port: CLI flag > env var > default.
+
+    The port is configurable because the default is a popular one; anything
+    already bound to it (a container publishing 8888, say) would otherwise make
+    the wizard unrunnable without editing the source.
+    """
+    parser = argparse.ArgumentParser(
+        prog="mcp-apple-music-setup",
+        description="One-time Apple Music authorisation wizard.",
     )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=(
+            "Local port for the browser callback "
+            f"(default: ${PORT_ENV_VAR} or {DEFAULT_PORT})."
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    if args.port is not None:
+        port = args.port
+        source = "--port"
+    elif os.environ.get(PORT_ENV_VAR, "").strip():
+        raw = os.environ[PORT_ENV_VAR].strip()
+        try:
+            port = int(raw)
+        except ValueError:
+            parser.error(f"{PORT_ENV_VAR} must be an integer, got {raw!r}")
+        source = PORT_ENV_VAR
+    else:
+        return DEFAULT_PORT
+
+    if not 1 <= port <= 65535:
+        parser.error(f"{source} must be between 1 and 65535, got {port}")
+    return port
 
 
 # ------------------------------------------------------------------ #
@@ -218,6 +402,8 @@ def _generate_developer_token(cfg: dict) -> str:
 
 
 def main() -> None:
+    port = _resolve_port()
+
     print("\n🎵  Apple Music MCP — Setup Wizard\n" + "─" * 42 + "\n")
 
     cfg = _load_existing()
@@ -233,35 +419,65 @@ def main() -> None:
     if not cfg.get("team_id"):
         print("\n📋  Apple Developer credentials")
         print("    (Find these at developer.apple.com → Account → Membership)\n")
-        cfg["team_id"]          = _ask("  Team ID")
-        cfg["key_id"]           = _ask("  MusicKit Key ID")
-        cfg["private_key_path"] = _ask("  Path to .p8 file (e.g. ~/Downloads/AuthKey_XXXXXX.p8)")
-        cfg["storefront"]       = _ask("  Storefront country code", default="it")
+        cfg["team_id"] = _ask("  Team ID")
+        cfg["key_id"]  = _ask("  MusicKit Key ID")
+        _ask_key_source(cfg)
+        cfg["storefront"] = _ask("\n  Storefront country code", default="us")
 
-    # Validate the .p8 path
-    p8 = Path(cfg["private_key_path"]).expanduser()
-    if not p8.exists():
-        print(f"\n❌  .p8 file not found: {p8}")
+    # --- Read and validate the signing key --------------------------- #
+    # Done once, up front, so a bad path or an unreadable 1Password reference
+    # fails here rather than at the first tool call. The key is then reused for
+    # the token below, so a vault read prompts at most once per run.
+    print("\n🔑  Reading the signing key…")
+    try:
+        private_key = load_private_key(cfg)
+        print("    ✅  Key read and validated")
+    except PrivateKeyError as exc:
+        print(f"\n❌  {exc}")
         sys.exit(1)
 
     # --- Generate Developer Token ----------------------------------- #
     print("\n🔑  Generating Developer Token…")
     try:
-        developer_token = _generate_developer_token(cfg)
+        developer_token, _expiry = generate_developer_token(
+            team_id=cfg["team_id"],
+            key_id=cfg["key_id"],
+            private_key=private_key,
+        )
         print("    ✅  Developer Token OK")
     except Exception as exc:
         print(f"\n❌  Failed to generate Developer Token: {exc}")
         sys.exit(1)
 
     # --- Start local HTTP server ------------------------------------ #
+    # Fresh secret per run. Only the browser we launch ever learns it, so a
+    # page on another origin cannot read the developer token from us or plant
+    # a token into our config.
+    nonce = secrets.token_urlsafe(32)
+
     _Handler.html = _HTML.replace("{{DEVELOPER_TOKEN}}", developer_token)
-    server = HTTPServer(("localhost", PORT), _Handler)
+    _Handler.nonce = nonce
+    _Handler.allowed_hosts = frozenset(
+        {f"{BIND_HOST}:{port}", f"localhost:{port}"}
+    )
+    _Handler.allowed_origins = frozenset(
+        {f"http://{BIND_HOST}:{port}", f"http://localhost:{port}"}
+    )
+
+    try:
+        server = HTTPServer((BIND_HOST, port), _Handler)
+    except OSError as exc:
+        print(f"\n❌  Cannot listen on {BIND_HOST}:{port} — {exc}")
+        print(f"    Choose another port:  mcp-apple-music-setup --port 8899")
+        sys.exit(1)
+
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
-    url = f"http://localhost:{PORT}"
+    url = f"http://{BIND_HOST}:{port}/?s={nonce}"
     print(f"\n🌐  Opening browser → {url}")
-    print("    If it doesn't open automatically, paste the URL into your browser.\n")
+    print("    If it doesn't open automatically, paste the URL into your browser.")
+    print("    The ?s= value is a one-time secret for this run — don't share it.\n")
     webbrowser.open(url)
 
     print("⏳  Waiting for you to authorise in the browser (timeout: 5 minutes)…\n")

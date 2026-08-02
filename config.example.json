@@ -1,7 +1,15 @@
 {
   "team_id": "XXXXXXXXXX",
   "key_id": "XXXXXXXXXX",
+
+  "_comment": "Set exactly ONE key source below. Delete the others.",
+
+  "private_key_op_ref": "op://Private/MusicKit/AuthKey.p8",
   "private_key_path": "~/Downloads/AuthKey_XXXXXXXXXX.p8",
-  "storefront": "it",
+
+  "_op_cli_path_comment": "Only needed if `op` is not on PATH.",
+  "op_cli_path": "/opt/homebrew/bin/op",
+
+  "storefront": "us",
   "music_user_token": ""
 }

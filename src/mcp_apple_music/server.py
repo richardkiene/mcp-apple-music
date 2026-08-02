@@ -18,6 +18,8 @@ Tools provided:
   - get_recommendations     Get personalised Apple Music picks
 """
 
+from urllib.parse import quote
+
 from mcp.server.fastmcp import FastMCP
 
 from .auth import AppleMusicAuth
@@ -71,6 +73,16 @@ def _fmt_album(item: dict, index: int) -> str:
 def _fmt_artist(item: dict, index: int) -> str:
     a = item.get("attributes", {})
     return f"  {index}. {a.get('name', '?')} | ID: {item.get('id', '?')}"
+
+
+def _playlist_tracks_path(playlist_id: str) -> str:
+    """Build the tracks path for a playlist, encoding the caller-supplied ID.
+
+    httpx resolves dot segments when it normalises a URL, so an unencoded ID
+    containing '..' would silently retarget the request at a different Apple
+    Music endpoint than the one this tool intends to call.
+    """
+    return f"/me/library/playlists/{quote(playlist_id, safe='')}/tracks"
 
 
 def _fmt_playlist(item: dict, index: int) -> str:
@@ -328,7 +340,7 @@ async def get_playlist_tracks(playlist_id: str, limit: int = 100) -> str:
     """
     client = _get_client()
     data = await client.get(
-        f"/me/library/playlists/{playlist_id}/tracks",
+        _playlist_tracks_path(playlist_id),
         params={"limit": min(max(1, limit), 100)},
     )
     tracks = data.get("data", [])
@@ -399,7 +411,7 @@ async def add_tracks_to_playlist(
 
     client = _get_client()
     body = {"data": [{"id": tid, "type": track_type} for tid in track_ids]}
-    await client.post(f"/me/library/playlists/{playlist_id}/tracks", body)
+    await client.post(_playlist_tracks_path(playlist_id), body)
 
     return (
         f"✅ Added {len(track_ids)} track(s) to playlist [{playlist_id}].\n"
