@@ -122,9 +122,14 @@ source.
 ## PEM validation
 
 Every source's output is validated by loading it and confirming it is an
-elliptic-curve private key on P-256, the curve ES256 requires. A truncated file
-and a mangled vault field fail identically, at setup, rather than as an opaque
-signing error later.
+elliptic-curve private key on P-256, the curve ES256 requires. Truncation,
+corrupted key material, an RSA key, and the wrong curve all fail at setup with a
+named cause rather than as an opaque signing error later.
+
+Whitespace variation is *not* rejected. OpenSSL's PEM reader is
+whitespace-tolerant, so a field that turned the newlines into spaces still
+yields a key that signs correctly — rejecting it would be a false alarm. The
+test suite asserts this explicitly by signing with such a key.
 
 Escaped-newline normalisation (`\\n` to a real newline) applies **only** to
 `private_key_content`, where environment variables routinely carry the PEM
