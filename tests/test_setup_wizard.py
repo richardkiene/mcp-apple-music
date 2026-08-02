@@ -221,6 +221,32 @@ def test_missing_token_field_is_refused():
         assert setup._received_token == []
 
 
+def test_referrer_policy_does_not_withhold_the_origin_from_apple():
+    """Regression guard: `no-referrer` silently breaks MusicKit authorisation.
+
+    Apple's authorisation service rejects the token exchange with
+    AUTHORIZATION_ERROR when the browser sends no Referer, and does so only
+    after the consent screen has already succeeded — so the symptom looks like
+    an account or network problem, not a response header. Confirmed by
+    bisecting this exact header against a working upstream baseline.
+
+    The policy must still be origin-only, so the ?s= nonce in the page URL is
+    never sent to a cross-origin host.
+    """
+    with running_wizard() as port:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", f"/?s={NONCE}")
+        response = conn.getresponse()
+        policy = response.getheader("Referrer-Policy")
+        response.read()
+        conn.close()
+
+    assert policy == "strict-origin-when-cross-origin", (
+        f"Referrer-Policy is {policy!r}. It must send the origin — 'no-referrer' "
+        "breaks Apple authorisation — while still stripping the nonce."
+    )
+
+
 def test_unknown_routes_are_not_found():
     with running_wizard() as port:
         assert _request(port, "GET", f"/secrets?s={NONCE}")[0] == 404

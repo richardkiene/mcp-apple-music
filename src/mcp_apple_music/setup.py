@@ -138,9 +138,20 @@ _HTML = """\
           throw new Error('Server responded with ' + res.status);
         }
       } catch (e) {
-        status.textContent = 'Error: ' + e.message;
+        // MusicKit raises MKError, whose name and errorCode say far more than
+        // message alone — 'Unauthorized' on its own cannot distinguish a denied
+        // consent from a missing subscription from a failed token exchange.
+        // Surface all of it rather than making the next person guess.
+        const parts = [e.name, e.errorCode, e.message].filter(Boolean);
+        status.textContent = 'Error: ' + (parts.join(' / ') || String(e));
         status.className   = 'err';
-        btn.disabled       = false;
+        console.error('MusicKit authorisation failed:', e);
+        try {
+          console.error(
+            'detail:', JSON.stringify(e, Object.getOwnPropertyNames(e))
+          );
+        } catch (_) { /* non-serialisable error object */ }
+        btn.disabled = false;
       }
     });
   </script>
@@ -219,9 +230,18 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        # The page embeds a signed token; keep it out of caches and referrers.
+        # The page embeds a signed token; keep it out of caches.
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Referrer-Policy", "no-referrer")
+        # Deliberately NOT no-referrer. Apple's authorisation service rejects
+        # the token exchange with AUTHORIZATION_ERROR when the browser sends no
+        # Referer — and it does so *after* the consent screen has succeeded,
+        # which makes it look like an account or network fault rather than a
+        # response header. Bisected against a working upstream baseline.
+        #
+        # strict-origin-when-cross-origin still withholds the path and query
+        # cross-origin, so the ?s= nonce never reaches Apple, while supplying
+        # the origin the handshake requires.
+        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
         self.end_headers()
         self.wfile.write(body)
 
