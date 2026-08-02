@@ -1,10 +1,12 @@
 """Developer token generation and private key loading."""
 
+import subprocess
+
 from cryptography.hazmat.primitives import serialization
 import jwt
 import pytest
 
-from mcp_apple_music import auth
+from mcp_apple_music import auth, keysource
 
 
 def _public_pem(private_pem: str) -> str:
@@ -60,31 +62,6 @@ def test_token_verifies_against_the_signing_key(ec_private_key_pem):
     assert claims["iss"] == "TEAM123456"
 
 
-def test_read_private_key_prefers_inline_content(ec_private_key_pem):
-    config = {"private_key_content": ec_private_key_pem}
-    assert auth.read_private_key(config) == ec_private_key_pem
-
-
-def test_read_private_key_unescapes_newlines_from_env_vars(ec_private_key_pem):
-    """Env vars commonly carry the PEM with literal backslash-n sequences."""
-    escaped = ec_private_key_pem.replace("\n", "\\n")
-    assert auth.read_private_key({"private_key_content": escaped}) == ec_private_key_pem
-
-
-def test_read_private_key_reads_from_path(tmp_path, ec_private_key_pem):
-    p8 = tmp_path / "AuthKey_TEST.p8"
-    p8.write_text(ec_private_key_pem)
-
-    assert auth.read_private_key({"private_key_path": str(p8)}) == ec_private_key_pem
-
-
-def test_read_private_key_fails_loudly_on_missing_file(tmp_path):
-    missing = tmp_path / "nope.p8"
-
-    with pytest.raises(FileNotFoundError, match="MusicKit private key not found"):
-        auth.read_private_key({"private_key_path": str(missing)})
-
-
 def test_cached_token_is_reused_until_the_renewal_margin(ec_private_key_pem, tmp_path):
     """Signing on every request would be wasteful; signing too late would race."""
     instance = auth.AppleMusicAuth(config_path=tmp_path / "absent.json")
@@ -100,3 +77,34 @@ def test_cached_token_is_reused_until_the_renewal_margin(ec_private_key_pem, tmp
     # Push the clock past the renewal margin; the next call must re-sign.
     instance._token_expiry = 0
     assert instance.get_developer_token() is not first
+
+
+def test_private_key_is_resolved_once_across_token_regenerations(
+    monkeypatch, ec_private_key_pem, tmp_path
+):
+    """Resolving the key can be interactive — a 1Password read may raise a
+    biometric prompt — so the hourly re-sign must reuse the cached PEM.
+    """
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=ec_private_key_pem, stderr="")
+
+    monkeypatch.setattr(keysource.subprocess, "run", fake_run)
+
+    instance = auth.AppleMusicAuth(config_path=tmp_path / "absent.json")
+    instance._config = {
+        "team_id": "TEAM123456",
+        "key_id": "KEY1234567",
+        "private_key_op_ref": "op://Private/MusicKit/AuthKey.p8",
+    }
+
+    first = instance.get_developer_token()
+    instance._token_expiry = 0
+    second = instance.get_developer_token()
+    instance._token_expiry = 0
+    instance.get_developer_token()
+
+    assert second is not first, "token should have been re-signed"
+    assert len(calls) == 1, f"1Password consulted {len(calls)} times, expected 1"
