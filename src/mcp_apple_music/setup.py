@@ -30,7 +30,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
-from .auth import generate_developer_token, read_private_key
+from .auth import generate_developer_token
+from .keysource import SOURCE_KEYS, PrivateKeyError, load_private_key
 
 CONFIG_DIR = Path.home() / ".config" / "mcp-apple-music"
 CONFIG_PATH = CONFIG_DIR / "config.json"
@@ -305,18 +306,34 @@ def _ask(prompt: str, default: str = "") -> str:
     return value or default
 
 
-def _generate_developer_token(cfg: dict) -> str:
-    """Sign a developer token for the browser handshake.
+def _ask_key_source(cfg: dict) -> None:
+    """Ask where the .p8 lives and record exactly one source key in cfg."""
+    print("\n🔐  Where is your MusicKit .p8 signing key?")
+    print("      1) 1Password  — recommended; the key never lands on disk")
+    print("      2) A file on this machine")
+    choice = _ask("  Choose", default="1")
 
-    Delegates to auth.generate_developer_token so the signing parameters —
-    algorithm, claims, and lifetime — are defined in exactly one place.
-    """
-    token, _expiry = generate_developer_token(
-        team_id=cfg["team_id"],
-        key_id=cfg["key_id"],
-        private_key=read_private_key(cfg),
-    )
-    return token
+    # Clear every source first: switching sources must not leave a stale one
+    # behind, which would be rejected later as an ambiguous configuration.
+    for key in SOURCE_KEYS:
+        cfg.pop(key, None)
+
+    if choice == "2":
+        cfg["private_key_path"] = _ask(
+            "  Path to .p8 file (e.g. ~/Downloads/AuthKey_XXXXXX.p8)"
+        )
+        return
+
+    print("\n     In 1Password, right-click the .p8 attachment and choose")
+    print("     'Copy Secret Reference'. It looks like:")
+    print("         op://Private/MusicKit/AuthKey.p8\n")
+    cfg["private_key_op_ref"] = _ask("  1Password secret reference")
+
+    print("\n     Leave the next answer blank unless `op` is off your PATH.")
+    print("     GUI-launched apps often need its absolute path here.")
+    op_path = _ask("  Path to the `op` binary")
+    if op_path:
+        cfg["op_cli_path"] = op_path
 
 
 def _resolve_port(argv: Optional[list[str]] = None) -> int:
@@ -382,21 +399,31 @@ def main() -> None:
     if not cfg.get("team_id"):
         print("\n📋  Apple Developer credentials")
         print("    (Find these at developer.apple.com → Account → Membership)\n")
-        cfg["team_id"]          = _ask("  Team ID")
-        cfg["key_id"]           = _ask("  MusicKit Key ID")
-        cfg["private_key_path"] = _ask("  Path to .p8 file (e.g. ~/Downloads/AuthKey_XXXXXX.p8)")
-        cfg["storefront"]       = _ask("  Storefront country code", default="it")
+        cfg["team_id"] = _ask("  Team ID")
+        cfg["key_id"]  = _ask("  MusicKit Key ID")
+        _ask_key_source(cfg)
+        cfg["storefront"] = _ask("\n  Storefront country code", default="us")
 
-    # Validate the .p8 path
-    p8 = Path(cfg["private_key_path"]).expanduser()
-    if not p8.exists():
-        print(f"\n❌  .p8 file not found: {p8}")
+    # --- Read and validate the signing key --------------------------- #
+    # Done once, up front, so a bad path or an unreadable 1Password reference
+    # fails here rather than at the first tool call. The key is then reused for
+    # the token below, so a vault read prompts at most once per run.
+    print("\n🔑  Reading the signing key…")
+    try:
+        private_key = load_private_key(cfg)
+        print("    ✅  Key read and validated")
+    except PrivateKeyError as exc:
+        print(f"\n❌  {exc}")
         sys.exit(1)
 
     # --- Generate Developer Token ----------------------------------- #
     print("\n🔑  Generating Developer Token…")
     try:
-        developer_token = _generate_developer_token(cfg)
+        developer_token, _expiry = generate_developer_token(
+            team_id=cfg["team_id"],
+            key_id=cfg["key_id"],
+            private_key=private_key,
+        )
         print("    ✅  Developer Token OK")
     except Exception as exc:
         print(f"\n❌  Failed to generate Developer Token: {exc}")
