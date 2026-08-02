@@ -11,14 +11,20 @@ Apple Music uses a two-token system:
                         Its ~6-month lifetime is set by Apple and is
                         independent of the developer token's expiry.
 
+The signing key itself comes from exactly one source — a 1Password vault, a
+file, or inline PEM content — resolved by the keysource module.
+
 Configuration can be provided via:
   - Config file: ~/.config/mcp-apple-music/config.json  (default)
   - Environment variables (useful for Docker / CI):
-      APPLE_TEAM_ID            Your Apple Developer Team ID
-      APPLE_KEY_ID             Your MusicKit Key ID
-      APPLE_PRIVATE_KEY        Full content of your .p8 private key
-      APPLE_MUSIC_USER_TOKEN   Your Music User Token
-      APPLE_STOREFRONT         App Store storefront (default: us)
+      APPLE_TEAM_ID              Your Apple Developer Team ID
+      APPLE_KEY_ID               Your MusicKit Key ID
+      APPLE_PRIVATE_KEY          Full content of your .p8 private key
+      APPLE_PRIVATE_KEY_OP_REF   1Password reference to the .p8 instead
+      APPLE_MUSIC_USER_TOKEN     Your Music User Token
+      APPLE_STOREFRONT           App Store storefront (default: us)
+      OP_CLI_PATH                Absolute path to the `op` binary, if it is
+                                 not on PATH (GUI launchers often lack it)
 """
 
 import json
@@ -29,6 +35,8 @@ from typing import Optional
 
 import jwt  # PyJWT
 
+from .keysource import load_private_key
+
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "mcp-apple-music" / "config.json"
 
 # Apple permits up to six months, but the token is re-signed from the local .p8
@@ -38,22 +46,6 @@ DEVELOPER_TOKEN_TTL_SECONDS = 3600  # 1 hour
 
 # Re-sign this long before expiry rather than racing the deadline mid-request.
 TOKEN_RENEWAL_MARGIN_SECONDS = 300  # 5 minutes
-
-
-def read_private_key(config: dict) -> str:
-    """Return the PEM-encoded MusicKit private key referenced by a config dict.
-
-    Supports both inline key content (environment variables) and a path to a
-    .p8 file (config.json).
-    """
-    inline = config.get("private_key_content")
-    if inline:
-        return inline.replace("\\n", "\n")
-
-    key_path = Path(config["private_key_path"]).expanduser()
-    if not key_path.exists():
-        raise FileNotFoundError(f"MusicKit private key not found: {key_path}")
-    return key_path.read_text()
 
 
 def generate_developer_token(
@@ -87,6 +79,10 @@ class AppleMusicAuth:
         self._config: Optional[dict] = None
         self._developer_token: Optional[str] = None
         self._token_expiry: float = 0
+        # Cached for the process lifetime. Resolving the key can be expensive
+        # and interactive — a 1Password read may raise a biometric prompt — so
+        # the hourly token re-sign must not repeat it.
+        self._private_key: Optional[str] = None
 
     # ------------------------------------------------------------------ #
     #  Config                                                              #
@@ -104,17 +100,27 @@ class AppleMusicAuth:
         env_team_id = os.environ.get("APPLE_TEAM_ID", "").strip()
         env_key_id = os.environ.get("APPLE_KEY_ID", "").strip()
         env_private_key = os.environ.get("APPLE_PRIVATE_KEY", "").strip()
+        env_op_ref = os.environ.get("APPLE_PRIVATE_KEY_OP_REF", "").strip()
+        env_op_cli = os.environ.get("OP_CLI_PATH", "").strip()
         env_user_token = os.environ.get("APPLE_MUSIC_USER_TOKEN", "").strip()
         env_storefront = os.environ.get("APPLE_STOREFRONT", "").strip()
 
-        if env_team_id and env_key_id and env_private_key:
-            return {
+        if env_team_id and env_key_id and (env_private_key or env_op_ref):
+            config = {
                 "team_id": env_team_id,
                 "key_id": env_key_id,
-                "private_key_content": env_private_key,  # key content, not path
                 "music_user_token": env_user_token,
                 "storefront": env_storefront or "us",
             }
+            # Set whatever is present and let keysource reject the ambiguity if
+            # both are, rather than quietly preferring one here.
+            if env_private_key:
+                config["private_key_content"] = env_private_key
+            if env_op_ref:
+                config["private_key_op_ref"] = env_op_ref
+            if env_op_cli:
+                config["op_cli_path"] = env_op_cli
+            return config
 
         # Fall back to config file
         if not self.config_path.exists():
@@ -123,8 +129,9 @@ class AppleMusicAuth:
                 "    Run the setup wizard first:\n\n"
                 "        mcp-apple-music-setup\n\n"
                 "    Or set environment variables:\n"
-                "        APPLE_TEAM_ID, APPLE_KEY_ID, APPLE_PRIVATE_KEY,\n"
-                "        APPLE_MUSIC_USER_TOKEN, APPLE_STOREFRONT\n"
+                "        APPLE_TEAM_ID, APPLE_KEY_ID, APPLE_MUSIC_USER_TOKEN,\n"
+                "        APPLE_STOREFRONT, and one of APPLE_PRIVATE_KEY or\n"
+                "        APPLE_PRIVATE_KEY_OP_REF\n"
             )
         with open(self.config_path) as f:
             return json.load(f)
@@ -139,10 +146,13 @@ class AppleMusicAuth:
         if self._developer_token and now < self._token_expiry - TOKEN_RENEWAL_MARGIN_SECONDS:
             return self._developer_token
 
+        if self._private_key is None:
+            self._private_key = load_private_key(self.config)
+
         self._developer_token, self._token_expiry = generate_developer_token(
             team_id=self.config["team_id"],
             key_id=self.config["key_id"],
-            private_key=read_private_key(self.config),
+            private_key=self._private_key,
             now=now,
         )
         return self._developer_token
